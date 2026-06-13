@@ -1,0 +1,456 @@
+name: CD — Deploy to EKS
+
+on:
+  # Triggered by CI workflows via repository-dispatch
+  repository_dispatch:
+    types:
+      - deploy-vote
+      - deploy-result
+      - deploy-worker
+
+  # Manual deploy with service selection
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service to deploy (vote | result | worker | all)"
+        required: true
+        default: "all"
+        type: choice
+        options: [vote, result, worker, all]
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+      image_tag:
+        description: "Image tag/digest to deploy (leave blank for latest)"
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run (no actual changes)"
+        required: false
+        default: false
+        type: boolean
+
+# Prevent parallel deployments to the same environment
+concurrency:
+  group: cd-eks-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  # EKS cluster config — all come from secrets
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  KUBE_NAMESPACE_STAGING: ${{ secrets.KUBE_NAMESPACE_STAGING }}
+  KUBE_NAMESPACE_PRODUCTION: ${{ secrets.KUBE_NAMESPACE_PRODUCTION }}
+
+  # Registry
+  DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+  DOCKER_REPO: ${{ secrets.DOCKER_REPO }}
+
+  # Helm chart settings
+  HELM_RELEASE_NAME: ${{ secrets.HELM_RELEASE_NAME }}
+  HELM_CHART_PATH: ${{ secrets.HELM_CHART_PATH }}
+
+  # Slack notification (optional)
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # RESOLVE: figure out what to deploy
+  # ──────────────────────────────────────────────
+  resolve-deploy-context:
+    name: Resolve Deploy Context
+    runs-on: ubuntu-latest
+    outputs:
+      service: ${{ steps.ctx.outputs.service }}
+      environment: ${{ steps.ctx.outputs.environment }}
+      namespace: ${{ steps.ctx.outputs.namespace }}
+      image_tag: ${{ steps.ctx.outputs.image_tag }}
+      dry_run: ${{ steps.ctx.outputs.dry_run }}
+    steps:
+      - name: Resolve context
+        id: ctx
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            SERVICE="${{ github.event.client_payload.service }}"
+            ENV="staging"
+            IMAGE_TAG="${{ github.event.client_payload.digest }}"
+            DRY_RUN="false"
+          else
+            SERVICE="${{ github.event.inputs.service }}"
+            ENV="${{ github.event.inputs.environment }}"
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          fi
+
+          if [ "$ENV" = "production" ]; then
+            NAMESPACE="${{ secrets.KUBE_NAMESPACE_PRODUCTION }}"
+          else
+            NAMESPACE="${{ secrets.KUBE_NAMESPACE_STAGING }}"
+          fi
+
+          echo "service=$SERVICE"        >> $GITHUB_OUTPUT
+          echo "environment=$ENV"        >> $GITHUB_OUTPUT
+          echo "namespace=$NAMESPACE"    >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG"    >> $GITHUB_OUTPUT
+          echo "dry_run=$DRY_RUN"        >> $GITHUB_OUTPUT
+
+          echo "### Deploy Context" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`$SERVICE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`$ENV\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | \`$NAMESPACE\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`$IMAGE_TAG\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | \`$DRY_RUN\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────
+  # GATE: require approval for production
+  # ──────────────────────────────────────────────
+  production-gate:
+    name: Production Approval Gate
+    runs-on: ubuntu-latest
+    needs: resolve-deploy-context
+    if: needs.resolve-deploy-context.outputs.environment == 'production'
+    environment:
+      name: production          # Must be configured in repo Settings → Environments with required reviewers
+    steps:
+      - name: Approved for production
+        run: echo "Production deployment approved."
+
+  # ──────────────────────────────────────────────
+  # DEPLOY to EKS via Helm
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy → ${{ needs.resolve-deploy-context.outputs.environment }}
+    runs-on: ubuntu-latest
+    needs:
+      - resolve-deploy-context
+      - production-gate
+    # production-gate is skipped for non-prod; 'always()' lets us proceed when it's skipped
+    if: |
+      always() &&
+      (needs.production-gate.result == 'success' || needs.production-gate.result == 'skipped') &&
+      needs.resolve-deploy-context.result == 'success'
+    environment:
+      name: ${{ needs.resolve-deploy-context.outputs.environment }}
+      url: ${{ steps.get-url.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── AWS credentials ──
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-duration-seconds: 3600
+
+      # ── kubeconfig ──
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --alias voting-app-cluster
+
+      # ── Validate cluster access ──
+      - name: Validate cluster access
+        run: kubectl cluster-info
+
+      # ── Install Helm ──
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: "3.14.0"
+
+      # ── Helm diff (dry-run preview) ──
+      - name: Helm diff — vote
+        if: |
+          needs.resolve-deploy-context.outputs.service == 'vote' ||
+          needs.resolve-deploy-context.outputs.service == 'all'
+        run: |
+          helm plugin install https://github.com/databus23/helm-diff 2>/dev/null || true
+          helm diff upgrade \
+            --install \
+            --namespace ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            ${{ env.HELM_RELEASE_NAME }}-vote \
+            ${{ env.HELM_CHART_PATH }}/vote \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/vote \
+            --set image.tag=${{ needs.resolve-deploy-context.outputs.image_tag || 'latest' }} \
+            --set replicaCount=${{ secrets.VOTE_REPLICA_COUNT }} \
+            --set resources.requests.cpu=${{ secrets.VOTE_CPU_REQUEST }} \
+            --set resources.requests.memory=${{ secrets.VOTE_MEM_REQUEST }} \
+            --set resources.limits.cpu=${{ secrets.VOTE_CPU_LIMIT }} \
+            --set resources.limits.memory=${{ secrets.VOTE_MEM_LIMIT }} \
+            --set ingress.host=${{ secrets.VOTE_INGRESS_HOST }} \
+            --set ingress.tls.secretName=${{ secrets.VOTE_TLS_SECRET }} \
+            --set env.REDIS_HOST=${{ secrets.REDIS_HOST }} \
+            --set env.REDIS_PORT=${{ secrets.REDIS_PORT }} \
+            -f k8s/helm/vote/values-${{ needs.resolve-deploy-context.outputs.environment }}.yaml \
+            2>&1 || true
+
+      # ── Deploy: vote ──
+      - name: Deploy vote service
+        if: |
+          (needs.resolve-deploy-context.outputs.service == 'vote' ||
+           needs.resolve-deploy-context.outputs.service == 'all') &&
+          needs.resolve-deploy-context.outputs.dry_run == 'false'
+        run: |
+          helm upgrade \
+            --install \
+            --atomic \
+            --timeout 5m \
+            --cleanup-on-fail \
+            --namespace ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --create-namespace \
+            --history-max 10 \
+            ${{ env.HELM_RELEASE_NAME }}-vote \
+            ${{ env.HELM_CHART_PATH }}/vote \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/vote \
+            --set image.tag=${{ needs.resolve-deploy-context.outputs.image_tag || 'latest' }} \
+            --set replicaCount=${{ secrets.VOTE_REPLICA_COUNT }} \
+            --set resources.requests.cpu=${{ secrets.VOTE_CPU_REQUEST }} \
+            --set resources.requests.memory=${{ secrets.VOTE_MEM_REQUEST }} \
+            --set resources.limits.cpu=${{ secrets.VOTE_CPU_LIMIT }} \
+            --set resources.limits.memory=${{ secrets.VOTE_MEM_LIMIT }} \
+            --set ingress.host=${{ secrets.VOTE_INGRESS_HOST }} \
+            --set ingress.tls.secretName=${{ secrets.VOTE_TLS_SECRET }} \
+            --set env.REDIS_HOST=${{ secrets.REDIS_HOST }} \
+            --set env.REDIS_PORT=${{ secrets.REDIS_PORT }} \
+            -f k8s/helm/vote/values-${{ needs.resolve-deploy-context.outputs.environment }}.yaml
+
+      # ── Deploy: result ──
+      - name: Deploy result service
+        if: |
+          (needs.resolve-deploy-context.outputs.service == 'result' ||
+           needs.resolve-deploy-context.outputs.service == 'all') &&
+          needs.resolve-deploy-context.outputs.dry_run == 'false'
+        run: |
+          helm upgrade \
+            --install \
+            --atomic \
+            --timeout 5m \
+            --cleanup-on-fail \
+            --namespace ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --create-namespace \
+            --history-max 10 \
+            ${{ env.HELM_RELEASE_NAME }}-result \
+            ${{ env.HELM_CHART_PATH }}/result \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/result \
+            --set image.tag=${{ needs.resolve-deploy-context.outputs.image_tag || 'latest' }} \
+            --set replicaCount=${{ secrets.RESULT_REPLICA_COUNT }} \
+            --set resources.requests.cpu=${{ secrets.RESULT_CPU_REQUEST }} \
+            --set resources.requests.memory=${{ secrets.RESULT_MEM_REQUEST }} \
+            --set resources.limits.cpu=${{ secrets.RESULT_CPU_LIMIT }} \
+            --set resources.limits.memory=${{ secrets.RESULT_MEM_LIMIT }} \
+            --set ingress.host=${{ secrets.RESULT_INGRESS_HOST }} \
+            --set ingress.tls.secretName=${{ secrets.RESULT_TLS_SECRET }} \
+            --set env.DATABASE_HOST=${{ secrets.DB_HOST }} \
+            --set env.DATABASE_PORT=${{ secrets.DB_PORT }} \
+            --set env.DATABASE_NAME=${{ secrets.DB_NAME }} \
+            --set env.DATABASE_USER=${{ secrets.DB_USER }} \
+            --set env.DATABASE_PASSWORD=${{ secrets.DB_PASSWORD }} \
+            -f k8s/helm/result/values-${{ needs.resolve-deploy-context.outputs.environment }}.yaml
+
+      # ── Deploy: worker ──
+      - name: Deploy worker service
+        if: |
+          (needs.resolve-deploy-context.outputs.service == 'worker' ||
+           needs.resolve-deploy-context.outputs.service == 'all') &&
+          needs.resolve-deploy-context.outputs.dry_run == 'false'
+        run: |
+          helm upgrade \
+            --install \
+            --atomic \
+            --timeout 5m \
+            --cleanup-on-fail \
+            --namespace ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --create-namespace \
+            --history-max 10 \
+            ${{ env.HELM_RELEASE_NAME }}-worker \
+            ${{ env.HELM_CHART_PATH }}/worker \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/worker \
+            --set image.tag=${{ needs.resolve-deploy-context.outputs.image_tag || 'latest' }} \
+            --set replicaCount=${{ secrets.WORKER_REPLICA_COUNT }} \
+            --set resources.requests.cpu=${{ secrets.WORKER_CPU_REQUEST }} \
+            --set resources.requests.memory=${{ secrets.WORKER_MEM_REQUEST }} \
+            --set resources.limits.cpu=${{ secrets.WORKER_CPU_LIMIT }} \
+            --set resources.limits.memory=${{ secrets.WORKER_MEM_LIMIT }} \
+            --set env.REDIS_HOST=${{ secrets.REDIS_HOST }} \
+            --set env.REDIS_PORT=${{ secrets.REDIS_PORT }} \
+            --set env.DATABASE_HOST=${{ secrets.DB_HOST }} \
+            --set env.DATABASE_PORT=${{ secrets.DB_PORT }} \
+            --set env.DATABASE_NAME=${{ secrets.DB_NAME }} \
+            --set env.DATABASE_USER=${{ secrets.DB_USER }} \
+            --set env.DATABASE_PASSWORD=${{ secrets.DB_PASSWORD }} \
+            -f k8s/helm/worker/values-${{ needs.resolve-deploy-context.outputs.environment }}.yaml
+
+      # ── Rollout status verification ──
+      - name: Verify rollout — vote
+        if: |
+          needs.resolve-deploy-context.outputs.service == 'vote' ||
+          needs.resolve-deploy-context.outputs.service == 'all'
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }}-vote \
+            -n ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --timeout=300s
+
+      - name: Verify rollout — result
+        if: |
+          needs.resolve-deploy-context.outputs.service == 'result' ||
+          needs.resolve-deploy-context.outputs.service == 'all'
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }}-result \
+            -n ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --timeout=300s
+
+      - name: Verify rollout — worker
+        if: |
+          needs.resolve-deploy-context.outputs.service == 'worker' ||
+          needs.resolve-deploy-context.outputs.service == 'all'
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }}-worker \
+            -n ${{ needs.resolve-deploy-context.outputs.namespace }} \
+            --timeout=300s
+
+      # ── Smoke test ──
+      - name: Smoke test — vote endpoint
+        if: |
+          (needs.resolve-deploy-context.outputs.service == 'vote' ||
+           needs.resolve-deploy-context.outputs.service == 'all') &&
+          needs.resolve-deploy-context.outputs.dry_run == 'false'
+        run: |
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 5 \
+            https://${{ secrets.VOTE_INGRESS_HOST }}/health || echo "000")
+          echo "Vote health check HTTP $HTTP_STATUS"
+          [ "$HTTP_STATUS" = "200" ] || { echo "::error::Vote smoke test failed ($HTTP_STATUS)"; exit 1; }
+
+      - name: Smoke test — result endpoint
+        if: |
+          (needs.resolve-deploy-context.outputs.service == 'result' ||
+           needs.resolve-deploy-context.outputs.service == 'all') &&
+          needs.resolve-deploy-context.outputs.dry_run == 'false'
+        run: |
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 5 \
+            https://${{ secrets.RESULT_INGRESS_HOST }}/health || echo "000")
+          echo "Result health check HTTP $HTTP_STATUS"
+          [ "$HTTP_STATUS" = "200" ] || { echo "::error::Result smoke test failed ($HTTP_STATUS)"; exit 1; }
+
+      # ── Get URL for environment URL ──
+      - name: Get app URL
+        id: get-url
+        run: |
+          echo "app_url=https://${{ secrets.VOTE_INGRESS_HOST }}" >> $GITHUB_OUTPUT
+
+      # ── Deployment summary ──
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ needs.resolve-deploy-context.outputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`${{ needs.resolve-deploy-context.outputs.service }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | \`${{ needs.resolve-deploy-context.outputs.namespace }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | \`${{ needs.resolve-deploy-context.outputs.dry_run }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────
+  # ROLLBACK on failure
+  # ──────────────────────────────────────────────
+  rollback-on-failure:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs:
+      - resolve-deploy-context
+      - deploy
+    if: failure() && needs.resolve-deploy-context.outputs.dry_run == 'false'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: "3.14.0"
+
+      - name: Rollback services
+        run: |
+          SERVICES_TO_ROLLBACK="${{ needs.resolve-deploy-context.outputs.service }}"
+          NS="${{ needs.resolve-deploy-context.outputs.namespace }}"
+
+          rollback_service() {
+            local SVC=$1
+            echo "Rolling back $SVC..."
+            if helm history ${{ env.HELM_RELEASE_NAME }}-$SVC -n $NS 2>/dev/null | grep -q deployed; then
+              helm rollback ${{ env.HELM_RELEASE_NAME }}-$SVC 0 -n $NS --wait --timeout 5m && \
+                echo "✅ $SVC rolled back" || \
+                echo "::warning::Rollback of $SVC failed"
+            else
+              echo "::notice::No previous release for $SVC — skipping rollback"
+            fi
+          }
+
+          if [ "$SERVICES_TO_ROLLBACK" = "all" ]; then
+            rollback_service vote
+            rollback_service result
+            rollback_service worker
+          else
+            rollback_service $SERVICES_TO_ROLLBACK
+          fi
+
+  # ──────────────────────────────────────────────
+  # NOTIFY
+  # ──────────────────────────────────────────────
+  notify:
+    name: Notify Slack
+    runs-on: ubuntu-latest
+    needs:
+      - resolve-deploy-context
+      - deploy
+    if: always() && env.SLACK_WEBHOOK_URL != ''
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ needs.deploy.result == 'success' && '✅' || '❌' }} *Voting App Deploy* — ${{ needs.resolve-deploy-context.outputs.service }} → ${{ needs.resolve-deploy-context.outputs.environment }}",
+              "attachments": [
+                {
+                  "color": "${{ needs.deploy.result == 'success' && 'good' || 'danger' }}",
+                  "fields": [
+                    { "title": "Status", "value": "${{ needs.deploy.result }}", "short": true },
+                    { "title": "Service", "value": "${{ needs.resolve-deploy-context.outputs.service }}", "short": true },
+                    { "title": "Environment", "value": "${{ needs.resolve-deploy-context.outputs.environment }}", "short": true },
+                    { "title": "Actor", "value": "${{ github.actor }}", "short": true },
+                    { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View>", "short": true }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
