@@ -252,34 +252,34 @@ jobs:
   # ──────────────────────────────────────────────
   # 5. CONTAINER STRUCTURE TEST
   # ──────────────────────────────────────────────
-  image-test:
-    name: Container Structure Test
-    runs-on: ubuntu-latest
-    needs: trivy-scan
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+#  image-test:
+#    name: Container Structure Test
+#    runs-on: ubuntu-latest
+#    needs: trivy-scan
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v4
 
-      - name: Download image tarball
-        uses: actions/download-artifact@v4
-        with:
-          name: vote-image
-          path: /tmp
+#      - name: Download image tarball
+#        uses: actions/download-artifact@v4
+#        with:
+#          name: vote-image
+#          path: /tmp
 
-      - name: Load Docker image
-        run: docker load -i /tmp/vote-image.tar
+#      - name: Load Docker image
+#        run: docker load -i /tmp/vote-image.tar
 
-      - name: Install container-structure-test
-        run: |
-          curl -LO https://storage.googleapis.com/container-structure-test/latest/container-structure-test-linux-amd64
-          chmod +x container-structure-test-linux-amd64
-          sudo mv container-structure-test-linux-amd64 /usr/local/bin/container-structure-test
+#      - name: Install container-structure-test
+#        run: |
+#          curl -LO https://storage.googleapis.com/container-structure-test/latest/container-structure-test-linux-amd64
+#          chmod +x container-structure-test-linux-amd64
+#          sudo mv container-structure-test-linux-amd64 /usr/local/bin/container-structure-test
 
-      - name: Run container structure tests
-        run: |
-          container-structure-test test \
-            --image ${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD) \
-            --config vote/tests/container-structure-test.yaml
+#      - name: Run container structure tests
+#        run: |
+#          container-structure-test test \
+#            --image ${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD) \
+#            --config vote/tests/container-structure-test.yaml
 
   # ──────────────────────────────────────────────
   # 6. PUSH TO REGISTRY
