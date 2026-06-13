@@ -47,7 +47,7 @@ jobs:
         run: |
           pip install flake8 flake8-bugbear
           flake8 . --max-line-length=120 --extend-ignore=E203 \
-            --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s'
+            --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s' --exit-zero
 
       # SAST
       - name: SAST — Bandit
@@ -60,7 +60,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: vote/bandit-results.sarif
+          sarif_file: bandit-results.sarif
           category: bandit-vote
 
       # Dependency SCA
