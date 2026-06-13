@@ -1,5 +1,8 @@
 name: CI — Vote Service (Python)
 
+#DOCKER_REGISTRY - docker.io
+#DOCKER_REPO - vilasvarghese/examplevotingapp_vote
+
 on:
   push:
     branches: [main, master, develop]
@@ -178,13 +181,14 @@ jobs:
           context: vote
           file: vote/Dockerfile
           push: false
-          load: true
+          load: true # Exports to local Docker daemon
+          platforms: linux/amd64 # Enforces a single architecture for local loading
+          provenance: false      # Prevents multi-architecture manifest list errors locally
+          sbom: false            # Prevents multi-architecture manifest list errors locally
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=vote
           cache-to: type=gha,mode=max,scope=vote
-          provenance: true
-          sbom: true
 
       - name: Save image tarball
         run: |
