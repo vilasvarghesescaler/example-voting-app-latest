@@ -336,41 +336,41 @@ jobs:
         uses: sigstore/cosign-installer@v3
         if: success()
 
-      - name: Cosign sign
-        if: success()
-        run: |
-          cosign sign --yes \
-            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-        env:
-          COSIGN_EXPERIMENTAL: "true"
+#      - name: Cosign sign
+#        if: success()
+#        run: |
+#          cosign sign --yes \
+#            ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+#        env:
+#          COSIGN_EXPERIMENTAL: "true"
 
-      - name: Image summary
-        run: |
-          echo "### Vote Image Published :rocket:" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Digest | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Tags | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
+#      - name: Image summary
+#        run: |
+#          echo "### Vote Image Published :rocket:" >> $GITHUB_STEP_SUMMARY
+#          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+#          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+#          echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+#          echo "| Digest | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+#          echo "| Tags | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
 
   # ──────────────────────────────────────────────
   # 7. NOTIFY CD
   # ──────────────────────────────────────────────
-  trigger-cd:
-    name: Trigger CD
-    runs-on: ubuntu-latest
-    needs: push-image
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    steps:
-      - name: Dispatch CD workflow
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.CD_DISPATCH_TOKEN }}
-          event-type: deploy-vote
-          client-payload: |
-            {
-              "service": "vote",
-              "image": "${{ env.IMAGE_NAME }}",
+#  trigger-cd:
+#    name: Trigger CD
+#    runs-on: ubuntu-latest
+#    needs: push-image
+#    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+#    steps:
+#      - name: Dispatch CD workflow
+#        uses: peter-evans/repository-dispatch@v3
+#        with:
+#          token: ${{ secrets.CD_DISPATCH_TOKEN }}
+#          event-type: deploy-vote
+#          client-payload: |
+#            {
+#              "service": "vote",
+#              "image": "${{ env.IMAGE_NAME }}",
               "digest": "${{ needs.push-image.outputs.image-digest }}",
               "sha": "${{ github.sha }}",
               "ref": "${{ github.ref }}"
