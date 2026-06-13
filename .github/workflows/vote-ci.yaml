@@ -371,7 +371,7 @@ jobs:
 #            {
 #              "service": "vote",
 #              "image": "${{ env.IMAGE_NAME }}",
-              "digest": "${{ needs.push-image.outputs.image-digest }}",
-              "sha": "${{ github.sha }}",
-              "ref": "${{ github.ref }}"
-            }
+#              "digest": "${{ needs.push-image.outputs.image-digest }}",
+#              "sha": "${{ github.sha }}",
+#              "ref": "${{ github.ref }}"
+#            }
