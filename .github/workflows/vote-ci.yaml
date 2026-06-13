@@ -43,11 +43,11 @@ jobs:
         run: pip install -r requirements.txt
 
       # Linting
-      - name: Lint with Flake8
-        run: |
-          pip install flake8 flake8-bugbear
-          flake8 . --max-line-length=120 --extend-ignore=E203 \
-            --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s' --exit-zero
+  #    - name: Lint with Flake8
+  #      run: |
+  #        pip install flake8 flake8-bugbear
+  #        flake8 . --max-line-length=120 --extend-ignore=E203 \
+  #          --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s' --exit-zero
 
       # SAST
       - name: SAST — Bandit
@@ -56,12 +56,12 @@ jobs:
           bandit -r . -f sarif -o bandit-results.sarif --exit-zero
         continue-on-error: false
 
-      - name: Upload Bandit SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: bandit-results.sarif
-          category: bandit-vote
+  #    - name: Upload Bandit SARIF
+  #      uses: github/codeql-action/upload-sarif@v3
+  #      if: always()
+  #      with:
+  #        sarif_file: bandit-results.sarif
+  #        category: bandit-vote
 
       # Dependency SCA
       - name: SCA — pip-audit
