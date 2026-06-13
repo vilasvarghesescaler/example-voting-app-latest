@@ -1,0 +1,58 @@
+# Container Structure Test — Result Service (Node.js)
+# Place at: result/tests/container-structure-test.yaml
+
+schemaVersion: "2.0.0"
+
+metadataTest:
+  exposedPorts:
+    - "80"
+  cmd: ["node", "server.js"]
+  workdir: "/app"
+
+fileExistenceTests:
+  - name: "server.js present"
+    path: "/app/server.js"
+    shouldExist: true
+
+  - name: "package.json present"
+    path: "/app/package.json"
+    shouldExist: true
+
+  - name: "node_modules present"
+    path: "/app/node_modules"
+    shouldExist: true
+
+  - name: "No .env file in image"
+    path: "/app/.env"
+    shouldExist: false
+
+  - name: "No .git in image"
+    path: "/app/.git"
+    shouldExist: false
+
+commandTests:
+  - name: "Node.js available"
+    command: "node"
+    args: ["--version"]
+    expectedOutput: ["v1[6-9]\\.|v2[0-9]\\."]
+
+  - name: "npm available"
+    command: "npm"
+    args: ["--version"]
+    exitCode: 0
+
+  - name: "package.json is valid JSON"
+    command: "node"
+    args: ["-e", "require('/app/package.json')"]
+    exitCode: 0
+
+  - name: "pg module importable"
+    command: "node"
+    args: ["-e", "require('pg')"]
+    exitCode: 0
+    workdir: "/app"
+
+  - name: "No root user"
+    command: "whoami"
+    excludedOutput: ["^root$"]
+
