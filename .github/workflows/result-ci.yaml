@@ -1,0 +1,385 @@
+name: CI — Result Service (Node.js)
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "result/**"
+      - ".github/workflows/ci-result.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "result/**"
+  workflow_dispatch:
+
+env:
+  SERVICE: result
+  IMAGE_NAME: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_REPO }}/result
+  NODE_VERSION: "18"
+
+defaults:
+  run:
+    working-directory: result
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. LINT & SCA
+  # ──────────────────────────────────────────────
+  lint-and-sca:
+    name: Lint & SCA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: result/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      # Lint
+      - name: Lint with ESLint
+        run: |
+          npx eslint . \
+            --ext .js,.ts \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file eslint-results.sarif || true
+
+      - name: Upload ESLint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: result/eslint-results.sarif
+          category: eslint-result
+
+      # SAST — CodeQL
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-result
+
+      # Dependency SCA
+      - name: SCA — npm audit
+        run: |
+          npm audit --json > npm-audit.json || true
+
+      - name: SCA — Snyk (optional, requires SNYK_TOKEN)
+        if: ${{ secrets.SNYK_TOKEN != '' }}
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=result/package.json
+
+      - name: Upload SCA results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-result-npm-audit
+          path: result/npm-audit.json
+          retention-days: 14
+
+  # ──────────────────────────────────────────────
+  # 2. UNIT TESTS
+  # ──────────────────────────────────────────────
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-sca
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: votes
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: result/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage --ci --reporters=default --reporters=jest-junit
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/votes
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: result/coverage
+          flags: result
+          name: result-coverage
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-result
+          path: result/junit.xml
+          retention-days: 14
+
+  # ──────────────────────────────────────────────
+  # 3. BUILD DOCKER IMAGE
+  # ──────────────────────────────────────────────
+  build-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: unit-test
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.title=result
+            org.opencontainers.image.description=Result service for example-voting-app
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build (no push)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: result
+          file: result/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=result
+          cache-to: type=gha,mode=max,scope=result
+          build-args: |
+            NODE_ENV=production
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Save image tarball
+        run: |
+          docker save ${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD) \
+            -o /tmp/result-image.tar
+
+      - name: Upload image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-image
+          path: /tmp/result-image.tar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # 4. TRIVY IMAGE SCAN
+  # ──────────────────────────────────────────────
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: result-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/result-image.tar
+
+      - name: Trivy scan (block on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan (full report)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          format: table
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-result
+
+  # ──────────────────────────────────────────────
+  # 5. CONTAINER STRUCTURE TEST
+  # ──────────────────────────────────────────────
+  image-test:
+    name: Container Structure Test
+    runs-on: ubuntu-latest
+    needs: trivy-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: result-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/result-image.tar
+
+      - name: Install container-structure-test
+        run: |
+          curl -LO https://storage.googleapis.com/container-structure-test/latest/container-structure-test-linux-amd64
+          chmod +x container-structure-test-linux-amd64
+          sudo mv container-structure-test-linux-amd64 /usr/local/bin/container-structure-test
+
+      - name: Run structure tests
+        run: |
+          container-structure-test test \
+            --image ${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD) \
+            --config result/tests/container-structure-test.yaml
+
+  # ──────────────────────────────────────────────
+  # 6. PUSH TO REGISTRY
+  # ──────────────────────────────────────────────
+  push-image:
+    name: Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [trivy-scan, image-test]
+    if: github.event_name != 'pull_request'
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: result
+          file: result/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=result
+          cache-to: type=gha,mode=max,scope=result
+          platforms: linux/amd64,linux/arm64
+          provenance: true
+          sbom: true
+          build-args: |
+            NODE_ENV=production
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Install cosign & sign image
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        run: |
+          cosign sign --yes ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      - name: Image summary
+        run: |
+          echo "### Result Image Published :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  trigger-cd:
+    name: Trigger CD
+    runs-on: ubuntu-latest
+    needs: push-image
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Dispatch CD workflow
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.CD_DISPATCH_TOKEN }}
+          event-type: deploy-result
+          client-payload: |
+            {
+              "service": "result",
+              "image": "${{ env.IMAGE_NAME }}",
+              "digest": "${{ needs.push-image.outputs.image-digest }}",
+              "sha": "${{ github.sha }}",
+              "ref": "${{ github.ref }}"
+            }
