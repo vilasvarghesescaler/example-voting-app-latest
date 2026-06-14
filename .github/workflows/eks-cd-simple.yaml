@@ -48,7 +48,7 @@ jobs:
           kubectl create namespace ${{ env.KUBE_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           
           # Applies all static yaml configuration files from your repo folder
-          kubectl apply -f k8s/manifests/ -n ${{ env.KUBE_NAMESPACE }}
+          kubectl apply -f k8s-specifications/ -n ${{ env.KUBE_NAMESPACE }}
 
       # ── 5. FORCE COURIER NEW IMAGE DIGEST ──
       - name: Update Deployment Image
