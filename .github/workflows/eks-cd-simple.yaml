@@ -11,7 +11,7 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
   KUBE_NAMESPACE: ${{ secrets.KUBE_NAMESPACE_STAGING }} # Simplifies to a single target namespace
-  IMAGE_NAME: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_REPO }}/vote
+  IMAGE_NAME: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_REPO }}
 
 jobs:
   deploy:
